@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+venv/
+build/
+dist/
+*.egg-info/
+
+.env
+*.local.json
+google_credentials.json
+credentials*.json
+translate-*.json
+translator.log
