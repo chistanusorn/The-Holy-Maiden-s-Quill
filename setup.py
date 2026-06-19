@@ -3,6 +3,14 @@ import sys
 from cx_Freeze import Executable, setup
 
 
+import glob
+credentials = glob.glob("translate-*.json")
+credentials_file = credentials[0] if credentials else None
+
+include_files = ["icon.ico"]
+if credentials_file:
+    include_files.append(credentials_file)
+
 build_exe_options = {
     "packages": [
         "os",
@@ -13,10 +21,9 @@ build_exe_options = {
         "google.cloud.vision",
         "google.cloud.translate_v2",
         "google.api_core",
+        "pythainlp",
     ],
-    "include_files": [
-        "icon.ico",
-    ],
+    "include_files": include_files,
     "excludes": ["tkinter"],
 }
 

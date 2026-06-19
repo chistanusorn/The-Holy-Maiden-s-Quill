@@ -11,4 +11,17 @@ dist/
 google_credentials.json
 credentials*.json
 translate-*.json
+config.json
 translator.log
+
+# IDEs and Editors
+.vscode/
+.idea/
+
+# OS-specific files
+Thumbs.db
+desktop.ini
+
+# Virtual environments
+env/
+.venv/

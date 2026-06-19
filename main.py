@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import sys
@@ -10,16 +11,25 @@ from pathlib import Path
 from threading import Thread
 from unicodedata import category
 
+try:
+    from pythainlp.tokenize import word_tokenize
+    HAS_PYTHAINLP = True
+except Exception:
+    HAS_PYTHAINLP = False
+
 import mss
 import mss.tools
 import qdarktheme
 from pynput import keyboard
 from PyQt5.QtCore import QObject, QRect, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen
+from PyQt5.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen, QImage
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
+    QFormLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QTextEdit,
@@ -41,6 +51,14 @@ MAX_OVERLAY_HEIGHT = 620
 CONTINUOUS_INTERVAL_MS = 1500
 SCENE_HISTORY_LIMIT = 20
 TRANSLATION_CACHE_LIMIT = 100
+ 
+LANG_MAP = {
+    "TH": {"code": "th", "name": "Thai"},
+    "EN": {"code": "en", "name": "English"},
+    "JP": {"code": "ja", "name": "Japanese"},
+    "KR": {"code": "ko", "name": "Korean"},
+    "CH": {"code": "zh", "name": "Chinese"},
+}
 
 
 @dataclass
@@ -367,6 +385,14 @@ def keep_rect_visible(rect):
     return rect
 
 
+def contains_japanese(text):
+    # Modified to allow any language (checks if the text contains any letters/alphabets)
+    for char in text:
+        if category(char).startswith("L"):
+            return True
+    return False
+
+
 def text_units(text):
     units = []
     current = ""
@@ -400,34 +426,66 @@ def split_long_token(token, metrics, max_width):
 
 def wrap_text_lines(text, font, max_width):
     metrics = QFontMetrics(font)
+    wrap_limit = max(10, max_width - 8)  # 8px safety margin to avoid QPainter accidental wraps
     lines = []
 
     for paragraph in text.splitlines() or [text]:
-        words = paragraph.split()
+        # Tokenize paragraph using pythainlp if available
+        use_pythainlp = HAS_PYTHAINLP
+        words = []
+        if use_pythainlp:
+            try:
+                words = word_tokenize(paragraph)
+            except Exception:
+                use_pythainlp = False
+
+        if not use_pythainlp:
+            words = paragraph.split()
+
         if not words:
             lines.append("")
             continue
 
         current = ""
         for word in words:
-            candidate = f"{current} {word}".strip()
-            if metrics.horizontalAdvance(candidate) <= max_width:
+            if use_pythainlp:
+                candidate = current + word
+            else:
+                candidate = f"{current} {word}" if current else word
+
+            # Measure width of candidate (strip for measurement to ignore trailing whitespace impact)
+            measured_candidate = candidate.strip()
+            if not measured_candidate or metrics.horizontalAdvance(measured_candidate) <= wrap_limit:
                 current = candidate
                 continue
 
+            # If it doesn't fit, commit current line
             if current:
-                lines.append(current)
+                stripped_current = current.strip()
+                if stripped_current:
+                    lines.append(stripped_current)
                 current = ""
 
-            if metrics.horizontalAdvance(word) <= max_width:
+            # Ignore leading spaces on the new line
+            if word.strip() == "":
+                continue
+
+            # Measure word itself
+            if metrics.horizontalAdvance(word.strip()) <= wrap_limit:
                 current = word
             else:
-                broken = split_long_token(word, metrics, max_width)
-                lines.extend(broken[:-1])
+                # If a single word is too long to fit, split it character-by-character
+                broken = split_long_token(word, metrics, wrap_limit)
+                for part in broken[:-1]:
+                    stripped_part = part.strip()
+                    if stripped_part:
+                        lines.append(stripped_part)
                 current = broken[-1] if broken else ""
 
         if current:
-            lines.append(current)
+            stripped_current = current.strip()
+            if stripped_current:
+                lines.append(stripped_current)
 
     return lines
 
@@ -524,12 +582,13 @@ class Communicate(QObject):
 
 class ControlPanelWindow(QWidget):
     def __init__(self):
+        self.is_loading = True
         super().__init__()
         self.setWindowTitle(APP_NAME)
         icon_path = resource_path("icon.ico")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
-        self.setMinimumSize(450, 500)
+        self.setMinimumSize(450, 600)
 
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(20, 20, 20, 20)
@@ -549,6 +608,47 @@ class ControlPanelWindow(QWidget):
         self.continuous_checkbox.setFont(QFont("Segoe UI", 10))
         self.layout.addWidget(self.continuous_checkbox)
 
+        # Settings Widget for Translation Engine & API Key
+        self.settings_widget = QWidget()
+        self.settings_layout = QFormLayout(self.settings_widget)
+        self.settings_layout.setContentsMargins(0, 0, 0, 0)
+        self.settings_layout.setSpacing(10)
+
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItems([
+            "Google Translate (เดิม)",
+            "9arm API (Qwen3.6)",
+            "9arm API (Gemma)",
+            "Gemini API (Google)"
+        ])
+        self.engine_combo.setFont(QFont("Segoe UI", 10))
+        self.settings_layout.addRow("ระบบแปลภาษา:", self.engine_combo)
+
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItems(["TH", "EN", "JP", "KR", "CH"])
+        self.lang_combo.setFont(QFont("Segoe UI", 10))
+        self.settings_layout.addRow("ภาษาปลายทาง:", self.lang_combo)
+
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setPlaceholderText("ใส่ API Key...")
+        self.api_key_input.setFont(QFont("Segoe UI", 10))
+        self.api_key_input.setEchoMode(QLineEdit.Password)
+
+        self.show_key_checkbox = QCheckBox("แสดงคีย์")
+        self.show_key_checkbox.setFont(QFont("Segoe UI", 9))
+        self.show_key_checkbox.toggled.connect(
+            lambda checked: self.api_key_input.setEchoMode(
+                QLineEdit.Normal if checked else QLineEdit.Password
+            )
+        )
+
+        key_layout = QVBoxLayout()
+        key_layout.addWidget(self.api_key_input)
+        key_layout.addWidget(self.show_key_checkbox)
+        self.settings_layout.addRow("API Key:", key_layout)
+
+        self.layout.addWidget(self.settings_widget)
+
         self.status_label = QLabel("Ready")
         self.status_label.setFont(QFont("Segoe UI", 9))
         self.status_label.setAlignment(Qt.AlignCenter)
@@ -563,11 +663,84 @@ class ControlPanelWindow(QWidget):
         self.log_display.setFont(QFont("Segoe UI", 10))
         self.layout.addWidget(self.log_display)
 
+        # Connect settings events and load existing config
+        self.engine_combo.currentIndexChanged.connect(self.toggle_api_key_visibility)
+        self.engine_combo.currentIndexChanged.connect(self.save_settings)
+        self.lang_combo.currentIndexChanged.connect(self.save_settings)
+        self.api_key_input.textChanged.connect(self.save_settings)
+        self.load_settings()
+        self.is_loading = False
+
+    def load_settings(self):
+        config_path = app_dir() / "config.json"
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    engine = data.get("engine", "google")
+                    api_key = data.get("gemini_api_key", "")
+                    target_lang = data.get("target_lang", "TH")
+                    
+                    if engine == "9arm_qwen":
+                        self.engine_combo.setCurrentIndex(1)
+                    elif engine == "9arm_gemma":
+                        self.engine_combo.setCurrentIndex(2)
+                    elif engine == "gemini":
+                        self.engine_combo.setCurrentIndex(3)
+                    else:
+                        self.engine_combo.setCurrentIndex(0)
+                    self.api_key_input.setText(api_key)
+                    
+                    lang_index = self.lang_combo.findText(target_lang)
+                    if lang_index >= 0:
+                        self.lang_combo.setCurrentIndex(lang_index)
+            except Exception as e:
+                logging.error(f"Failed to load settings: {e}")
+        self.toggle_api_key_visibility()
+
+    def save_settings(self):
+        config_path = app_dir() / "config.json"
+        engine_idx = self.engine_combo.currentIndex()
+        if engine_idx == 1:
+            engine = "9arm_qwen"
+            engine_name = "9arm API (Qwen3.6)"
+        elif engine_idx == 2:
+            engine = "9arm_gemma"
+            engine_name = "9arm API (Gemma)"
+        elif engine_idx == 3:
+            engine = "gemini"
+            engine_name = "Gemini API (Google)"
+        else:
+            engine = "google"
+            engine_name = "Google Translate (เดิม)"
+            
+        api_key = self.api_key_input.text().strip()
+        target_lang = self.lang_combo.currentText()
+        data = {
+            "engine": engine,
+            "gemini_api_key": api_key,
+            "target_lang": target_lang
+        }
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            if not getattr(self, "is_loading", False):
+                self.set_status(f"เปลี่ยนระบบแปลภาษาเป็น: {engine_name}")
+                logging.info(f"Engine changed to: {engine_name}")
+        except Exception as e:
+            logging.error(f"Failed to save settings: {e}")
+
+    def toggle_api_key_visibility(self):
+        needs_key = self.engine_combo.currentIndex() in (1, 2, 3)
+        self.api_key_input.setEnabled(needs_key)
+        self.show_key_checkbox.setEnabled(needs_key)
+
     def add_page_to_log(self, regions):
         if not regions:
             return
 
-        lines = ["แปลทั้งหน้า:"]
+        engine_name = self.engine_combo.currentText()
+        lines = [f"แปลทั้งหน้า [ใช้ระบบ: {engine_name}]:"]
         for index, region in enumerate(regions, 1):
             lines.append(f"{index}. ต้นฉบับ: {region.original}")
             lines.append(f"   คำแปล: {region.translated}")
@@ -726,6 +899,7 @@ class Controller:
 
         self.active_crop_rect = QRect(crop_rect)
         self.last_capture_digest = None
+        self._last_pixels = None
         if self.translation_in_progress:
             self.pending_scan = True
             self.control_panel.set_status("New area queued")
@@ -743,11 +917,24 @@ class Controller:
         try:
             crop_rect = QRect(self.active_crop_rect)
             image_bytes, capture_scale = capture_screen_region(crop_rect)
-            capture_digest = sha256(image_bytes).digest()
-            if not force and capture_digest == self.last_capture_digest:
-                return
-
-            self.last_capture_digest = capture_digest
+            
+            # Perceptual similarity check using downscaled grayscale image
+            qimg = QImage.fromData(image_bytes)
+            small_img = qimg.scaled(16, 16, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            
+            current_pixels = []
+            for y in range(16):
+                for x in range(16):
+                    color = QColor(small_img.pixel(x, y))
+                    gray = int(0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue())
+                    current_pixels.append(gray)
+            
+            if not force and hasattr(self, "_last_pixels") and self._last_pixels:
+                diff = sum(abs(a - b) for a, b in zip(current_pixels, self._last_pixels)) / 256.0
+                if diff < 3.0:  # Threshold: less than ~1.2% average pixel change
+                    return
+            
+            self._last_pixels = current_pixels
             self.start_translation_job(crop_rect, image_bytes, capture_scale)
         except Exception as exc:
             self.handle_job_failed(str(exc))
@@ -777,7 +964,41 @@ class Controller:
             scene_key = tuple(region.original for region in regions)
             translations = self.get_cached_translations(scene_key)
             if translations is None:
-                translations = self.google_service.translate_batch(list(scene_key))
+                # Identify which texts actually need translation (contain Japanese)
+                translated_map = {}
+                to_translate = []
+                for text in scene_key:
+                    if contains_japanese(text):
+                        to_translate.append(text)
+                    else:
+                        translated_map[text] = text  # Keep non-Japanese text as-is
+                
+                if to_translate:
+                    engine_idx = self.control_panel.engine_combo.currentIndex()
+                    target_lang_text = self.control_panel.lang_combo.currentText()
+                    lang_info = LANG_MAP.get(target_lang_text, {"code": "th", "name": "Thai"})
+                    target_code = lang_info["code"]
+                    target_name = lang_info["name"]
+                    
+                    if engine_idx in (1, 2, 3):
+                        api_key = self.control_panel.api_key_input.text().strip()
+                        if not api_key:
+                            raise ValueError("กรุณากรอก API Key ในช่องตั้งค่าการแปลภาษา")
+                        
+                        if engine_idx == 1:
+                            gemini_results = self.translate_with_custom_api(to_translate, api_key, "qwen3.6-35b-a3b", target_name)
+                        elif engine_idx == 2:
+                            gemini_results = self.translate_with_custom_api(to_translate, api_key, "diffusiongemma-26b-a4b", target_name)
+                        elif engine_idx == 3:
+                            gemini_results = self.translate_with_gemini_api(to_translate, api_key, target_name)
+                    else:
+                        gemini_results = self.google_service.translate_batch(to_translate, target_code)
+                    
+                    for text, trans in zip(to_translate, gemini_results):
+                        translated_map[text] = trans
+                
+                # Reconstruct translations list in original order
+                translations = [translated_map[text] for text in scene_key]
                 self.cache_translations(scene_key, translations)
 
             for region, translated_text in zip(regions, translations):
@@ -788,6 +1009,146 @@ class Controller:
             self.comm.job_failed.emit(str(exc))
         finally:
             self.comm.job_finished.emit()
+
+    def translate_with_custom_api(self, texts, api_key, model_name="qwen3.6-35b-a3b", target_name="Thai"):
+        import urllib.request
+        import urllib.error
+        
+        prompt = (
+            f"You are a professional game translator. Translate the following game text into natural, flowing {target_name}.\n"
+            "The translation should match the style of a visual novel/light novel, choosing appropriate pronouns for characters.\n"
+            "Maintain the context of the game. Translate the input list and return ONLY a JSON array of strings in the same order.\n"
+            f"Input:\n{json.dumps(texts, ensure_ascii=False)}"
+        )
+        
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        
+        url = "https://gateway.9arm.co/v1/chat/completions"
+        
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        
+        try:
+            req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+            with urllib.request.urlopen(req, timeout=15) as response:
+                response_data = response.read().decode('utf-8')
+                response_json = json.loads(response_data)
+                content = response_json["choices"][0]["message"]["content"]
+            
+            # Find json array in the content (some models wrap it in markdown block)
+            start_idx = content.find('[')
+            end_idx = content.rfind(']') + 1
+            if start_idx != -1 and end_idx != -1:
+                content = content[start_idx:end_idx]
+                
+            translated_list = json.loads(content)
+            if isinstance(translated_list, list) and len(translated_list) == len(texts):
+                return [str(t) for t in translated_list]
+            else:
+                logging.error(f"API returned invalid structure: {content}")
+        except Exception as e:
+            logging.error(f"Failed to parse API response: {e}")
+
+        # Fallback to single translate
+        fallback_translations = []
+        for text in texts:
+            try:
+                single_prompt = (
+                    f"Translate the following text into natural {target_name} for a game:\n"
+                    f"{text}"
+                )
+                single_payload = {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": single_prompt}]
+                }
+                req = urllib.request.Request(url, data=json.dumps(single_payload).encode('utf-8'), headers=headers, method='POST')
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    single_response_data = response.read().decode('utf-8')
+                    single_response_json = json.loads(single_response_data)
+                    single_content = single_response_json["choices"][0]["message"]["content"]
+                fallback_translations.append(single_content.strip())
+            except Exception as e:
+                logging.error(f"API fallback failed for '{text}': {e}")
+                fallback_translations.append(text)
+        return fallback_translations
+
+    def translate_with_gemini_api(self, texts, api_key, target_name="Thai"):
+        import urllib.request
+        import urllib.error
+        
+        prompt = (
+            f"You are a professional game translator. Translate the following game text into natural, flowing {target_name}.\n"
+            "The translation should match the style of a visual novel/light novel, choosing appropriate pronouns for characters.\n"
+            "Maintain the context of the game. Translate the input list and return ONLY a JSON array of strings in the same order.\n"
+            f"Input:\n{json.dumps(texts, ensure_ascii=False)}"
+        )
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+        
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": prompt
+                }]
+            }]
+        }
+        
+        try:
+            req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+            with urllib.request.urlopen(req, timeout=15) as response:
+                response_data = response.read().decode('utf-8')
+                response_json = json.loads(response_data)
+                content = response_json["candidates"][0]["content"]["parts"][0]["text"]
+            
+            # Find json array in the content (some models wrap it in markdown block)
+            start_idx = content.find('[')
+            end_idx = content.rfind(']') + 1
+            if start_idx != -1 and end_idx != -1:
+                content = content[start_idx:end_idx]
+                
+            translated_list = json.loads(content)
+            if isinstance(translated_list, list) and len(translated_list) == len(texts):
+                return [str(t) for t in translated_list]
+            else:
+                logging.error(f"Gemini API returned invalid structure: {content}")
+        except Exception as e:
+            logging.error(f"Failed to parse Gemini API response: {e}")
+
+        # Fallback to single translate
+        fallback_translations = []
+        for text in texts:
+            try:
+                single_prompt = (
+                    f"Translate the following text into natural {target_name} for a game:\n"
+                    f"{text}"
+                )
+                single_payload = {
+                    "contents": [{
+                        "parts": [{
+                            "text": single_prompt
+                        }]
+                    }]
+                }
+                req = urllib.request.Request(url, data=json.dumps(single_payload).encode('utf-8'), headers=headers, method='POST')
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    single_response_data = response.read().decode('utf-8')
+                    single_response_json = json.loads(single_response_data)
+                    single_content = single_response_json["candidates"][0]["content"]["parts"][0]["text"]
+                fallback_translations.append(single_content.strip())
+            except Exception as e:
+                logging.error(f"Gemini API fallback failed for '{text}': {e}")
+                fallback_translations.append(text)
+        return fallback_translations
 
     def get_cached_translations(self, scene_key):
         translations = self.translation_cache.get(scene_key)
@@ -818,6 +1179,7 @@ class Controller:
 
     def handle_job_failed(self, message):
         self.last_capture_digest = None
+        self._last_pixels = None
         show_error("Translation failed", message)
         self.control_panel.set_status("Translation failed")
 
