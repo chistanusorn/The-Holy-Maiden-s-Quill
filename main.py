@@ -21,7 +21,7 @@ import mss
 import mss.tools
 import qdarktheme
 from pynput import keyboard
-from PyQt5.QtCore import QObject, QRect, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, QRect, Qt, QTimer, pyqtSignal, QPoint
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen, QImage
 from PyQt5.QtWidgets import (
     QApplication,
@@ -619,7 +619,8 @@ class ControlPanelWindow(QWidget):
             "Google Translate (เดิม)",
             "9arm API (Qwen3.6)",
             "9arm API (Gemma)",
-            "Gemini API (Google)"
+            "Gemini API (Google)",
+            "API Gateway (Local)"
         ])
         self.engine_combo.setFont(QFont("Segoe UI", 10))
         self.settings_layout.addRow("ระบบแปลภาษา:", self.engine_combo)
@@ -687,6 +688,8 @@ class ControlPanelWindow(QWidget):
                         self.engine_combo.setCurrentIndex(2)
                     elif engine == "gemini":
                         self.engine_combo.setCurrentIndex(3)
+                    elif engine == "api_gateway":
+                        self.engine_combo.setCurrentIndex(4)
                     else:
                         self.engine_combo.setCurrentIndex(0)
                     self.api_key_input.setText(api_key)
@@ -710,6 +713,9 @@ class ControlPanelWindow(QWidget):
         elif engine_idx == 3:
             engine = "gemini"
             engine_name = "Gemini API (Google)"
+        elif engine_idx == 4:
+            engine = "api_gateway"
+            engine_name = "API Gateway (Local)"
         else:
             engine = "google"
             engine_name = "Google Translate (เดิม)"
@@ -752,55 +758,210 @@ class ControlPanelWindow(QWidget):
         self.status_label.setText(message)
 
 
-class OverlayWindow(QWidget):
-    def __init__(self):
-        super().__init__()
+class TextBubbleOverlay(QWidget):
+    def __init__(self, region, parent=None):
+        super().__init__(parent)
+        self.region = region
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.regions = []
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setMouseTracking(True)
+        self.setMinimumSize(100, 45)
+        
+        self.drag_position = None
+        self.resize_zone = 0
+        self.initial_geometry = None
         self.overlay_font = QFont("Segoe UI", 14, QFont.Bold)
-
-        self.hide()
-
-    def update_translations(self, regions):
-        self.regions = list(regions)
-        if not self.regions:
-            self.hide()
-            return
-
-        self.setGeometry(virtual_screen_geometry())
-        self.show()
-        self.update()
-
-    def hide_overlay(self):
-        self.regions = []
-        self.hide()
+        self.setGeometry(region.overlay_rect)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setFont(self.overlay_font)
-        painter.setPen(QColor(255, 255, 255))
 
-        origin = self.geometry().topLeft()
-        for region in self.regions:
-            box = QRect(region.overlay_rect).translated(-origin)
-            text_rect = box.adjusted(
-                OVERLAY_PADDING,
-                OVERLAY_PADDING,
-                -OVERLAY_PADDING,
-                -OVERLAY_PADDING,
-            )
-            painter.setBrush(QColor(0, 0, 0, 225))
-            painter.setPen(QPen(QColor(255, 255, 255, 100), 1))
-            painter.drawRoundedRect(box, 8, 8)
-            painter.setPen(QColor(255, 255, 255))
-            painter.drawText(
-                text_rect,
-                Qt.AlignCenter,
-                wrapped_text(region.translated, self.overlay_font, text_rect.width()),
-            )
+        box = self.rect()
+        text_rect = box.adjusted(
+            OVERLAY_PADDING,
+            OVERLAY_PADDING,
+            -OVERLAY_PADDING,
+            -OVERLAY_PADDING,
+        )
+        painter.setBrush(QColor(0, 0, 0, 225))
+        painter.setPen(QPen(QColor(255, 255, 255, 100), 1))
+        painter.drawRoundedRect(box, 8, 8)
+        
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(
+            text_rect,
+            Qt.AlignCenter,
+            wrapped_text(self.region.translated, self.overlay_font, text_rect.width()),
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            pos = event.pos()
+            rect = self.rect()
+            border = 8
+            
+            self.resize_zone = 0
+            if pos.x() < border:
+                self.resize_zone |= 1  # LEFT
+            elif pos.x() > rect.width() - border:
+                self.resize_zone |= 2  # RIGHT
+                
+            if pos.y() < border:
+                self.resize_zone |= 4  # TOP
+            elif pos.y() > rect.height() - border:
+                self.resize_zone |= 8  # BOTTOM
+                
+            self.drag_position = event.globalPos()
+            self.initial_geometry = self.geometry()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.LeftButton:
+            if self.drag_position is None:
+                return
+                
+            delta = event.globalPos() - self.drag_position
+            new_geom = QRect(self.initial_geometry)
+            
+            if self.resize_zone == 0:
+                # Dragging mode (move window)
+                new_geom.translate(delta)
+                self.setGeometry(new_geom)
+                self.region.overlay_rect = self.geometry()
+            else:
+                # Resizing mode
+                min_w = 100
+                min_h = 45
+                
+                # Left
+                if self.resize_zone & 1:
+                    new_left = self.initial_geometry.left() + delta.x()
+                    if new_left > self.initial_geometry.right() - min_w:
+                        new_left = self.initial_geometry.right() - min_w
+                    new_geom.setLeft(new_left)
+                # Right
+                elif self.resize_zone & 2:
+                    new_right = self.initial_geometry.right() + delta.x()
+                    if new_right < self.initial_geometry.left() + min_w:
+                        new_right = self.initial_geometry.left() + min_w
+                    new_geom.setRight(new_right)
+                    
+                # Top
+                if self.resize_zone & 4:
+                    new_top = self.initial_geometry.top() + delta.y()
+                    if new_top > self.initial_geometry.bottom() - min_h:
+                        new_top = self.initial_geometry.bottom() - min_h
+                    new_geom.setTop(new_top)
+                # Bottom
+                elif self.resize_zone & 8:
+                    new_bottom = self.initial_geometry.bottom() + delta.y()
+                    if new_bottom < self.initial_geometry.top() + min_h:
+                        new_bottom = self.initial_geometry.top() + min_h
+                    new_geom.setBottom(new_bottom)
+                    
+                self.setGeometry(new_geom)
+                self.region.overlay_rect = self.geometry()
+            event.accept()
+        else:
+            # Change cursor shape on hover
+            pos = event.pos()
+            rect = self.rect()
+            border = 8
+            
+            zone = 0
+            if pos.x() < border:
+                zone |= 1
+            elif pos.x() > rect.width() - border:
+                zone |= 2
+                
+            if pos.y() < border:
+                zone |= 4
+            elif pos.y() > rect.height() - border:
+                zone |= 8
+                
+            if zone == 5 or zone == 10:  # TOP|LEFT or BOTTOM|RIGHT
+                self.setCursor(Qt.SizeFDiagCursor)
+            elif zone == 6 or zone == 9:  # TOP|RIGHT or BOTTOM|LEFT
+                self.setCursor(Qt.SizeBDiagCursor)
+            elif zone & 3:  # LEFT or RIGHT
+                self.setCursor(Qt.SizeHorCursor)
+            elif zone & 12:  # TOP or BOTTOM
+                self.setCursor(Qt.SizeVerCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
+
+    def mouseReleaseEvent(self, event):
+        self.drag_position = None
+        self.resize_zone = 0
+
+
+class OverlayWindow(QObject):
+    def __init__(self):
+        super().__init__()
+        self.bubbles = []
+
+    def update_translations(self, regions):
+        # We want to map each new region to a previous bubble to reuse its geometry
+        assigned_bubbles = set()
+        new_geometries = {} # map of id(region) -> QRect
+        
+        # 1. Match by source_rect overlap
+        for region in regions:
+            best_bubble = None
+            best_overlap = 0.0
+            for bubble in self.bubbles:
+                if bubble in assigned_bubbles or not bubble.isVisible():
+                    continue
+                intersection = region.source_rect.intersected(bubble.region.source_rect)
+                if not intersection.isEmpty():
+                    area_int = intersection.width() * intersection.height()
+                    area_new = region.source_rect.width() * region.source_rect.height()
+                    area_old = bubble.region.source_rect.width() * bubble.region.source_rect.height()
+                    overlap = area_int / max(1, min(area_new, area_old))
+                    if overlap > best_overlap and overlap > 0.3:
+                        best_overlap = overlap
+                        best_bubble = bubble
+            if best_bubble:
+                new_geometries[id(region)] = best_bubble.geometry()
+                assigned_bubbles.add(best_bubble)
+                
+        # 2. Match remaining by distance
+        for region in regions:
+            if id(region) in new_geometries:
+                continue
+            best_bubble = None
+            best_dist = 100000.0
+            for bubble in self.bubbles:
+                if bubble in assigned_bubbles or not bubble.isVisible():
+                    continue
+                dist = (region.source_rect.center() - bubble.region.source_rect.center()).manhattanLength()
+                if dist < best_dist and dist < 150:
+                    best_dist = dist
+                    best_bubble = bubble
+            if best_bubble:
+                new_geometries[id(region)] = best_bubble.geometry()
+                assigned_bubbles.add(best_bubble)
+
+        self.hide_overlay()
+        
+        if not regions:
+            return
+
+        for region in regions:
+            if id(region) in new_geometries:
+                region.overlay_rect = new_geometries[id(region)]
+            
+            bubble = TextBubbleOverlay(region)
+            bubble.show()
+            self.bubbles.append(bubble)
+
+    def hide_overlay(self):
+        for bubble in self.bubbles:
+            bubble.close()
+        self.bubbles.clear()
 
 
 class CropWindow(QWidget):
@@ -980,17 +1141,20 @@ class Controller:
                     target_code = lang_info["code"]
                     target_name = lang_info["name"]
                     
-                    if engine_idx in (1, 2, 3):
-                        api_key = self.control_panel.api_key_input.text().strip()
-                        if not api_key:
-                            raise ValueError("กรุณากรอก API Key ในช่องตั้งค่าการแปลภาษา")
-                        
-                        if engine_idx == 1:
-                            gemini_results = self.translate_with_custom_api(to_translate, api_key, "qwen3.6-35b-a3b", target_name)
-                        elif engine_idx == 2:
-                            gemini_results = self.translate_with_custom_api(to_translate, api_key, "diffusiongemma-26b-a4b", target_name)
-                        elif engine_idx == 3:
-                            gemini_results = self.translate_with_gemini_api(to_translate, api_key, target_name)
+                    if engine_idx in (1, 2, 3, 4):
+                        if engine_idx in (1, 2, 3):
+                            api_key = self.control_panel.api_key_input.text().strip()
+                            if not api_key:
+                                raise ValueError("กรุณากรอก API Key ในช่องตั้งค่าการแปลภาษา")
+                            
+                            if engine_idx == 1:
+                                gemini_results = self.translate_with_custom_api(to_translate, api_key, "qwen3.6-35b-a3b", target_name)
+                            elif engine_idx == 2:
+                                gemini_results = self.translate_with_custom_api(to_translate, api_key, "diffusiongemma-26b-a4b", target_name)
+                            elif engine_idx == 3:
+                                gemini_results = self.translate_with_gemini_api(to_translate, api_key, target_name)
+                        elif engine_idx == 4:
+                            gemini_results = self.translate_with_api_gateway(to_translate, service="aistudio")
                     else:
                         gemini_results = self.google_service.translate_batch(to_translate, target_code)
                     
@@ -1149,6 +1313,37 @@ class Controller:
                 logging.error(f"Gemini API fallback failed for '{text}': {e}")
                 fallback_translations.append(text)
         return fallback_translations
+
+    def translate_with_api_gateway(self, texts, service="aistudio"):
+        import urllib.request
+        import urllib.error
+        
+        url = "http://localhost:3000/api/v1/translations/"
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        results = []
+        for text in texts:
+            payload = {
+                "service": service,
+                "text": text
+            }
+            try:
+                req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    response_data = response.read().decode('utf-8')
+                    response_json = json.loads(response_data)
+                    translated = response_json.get("data", {}).get("result", "")
+                    if translated:
+                        results.append(translated)
+                    else:
+                        logging.error(f"API Gateway returned no result for '{text}': {response_data}")
+                        results.append(text)
+            except Exception as e:
+                logging.error(f"API Gateway failed for '{text}': {e}")
+                results.append(text)
+        return results
 
     def get_cached_translations(self, scene_key):
         translations = self.translation_cache.get(scene_key)
